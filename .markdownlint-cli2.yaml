@@ -1,0 +1,16 @@
+# Markdown lint rules (`just lint`, checked by `checks.markdown`).
+config:
+  default: true
+  # Prettier wraps prose; tables, code and links may be longer.
+  MD013: false
+  # Collapsible FAQ entries, the side-by-side install table, line breaks in diagrams.
+  MD033:
+    allowed_elements: [details, summary, b, br, code, table, tr, th, td]
+  # Same sub-headings ("Linux", "Tests") under different sections are fine.
+  MD024:
+    siblings_only: true
+globs:
+  - "**/*.md"
+ignores:
+  - "target/**"
+  - "result*/**"

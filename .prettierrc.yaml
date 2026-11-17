@@ -1,0 +1,3 @@
+# Markdown formatting (`just fmt`, checked by `checks.markdown`).
+printWidth: 88
+proseWrap: always

@@ -1,0 +1,23 @@
+[package]
+name = "credential-bridge-core"
+description = "Configuration, paths and access policy for credential-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+credential-bridge-proto.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+toml_edit.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

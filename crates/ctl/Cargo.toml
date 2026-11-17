@@ -1,0 +1,22 @@
+[package]
+name = "credential-bridge-ctl"
+description = "Manage credential-bridge: the local daemon service and the SSH remotes it serves"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+clap_mangen.workspace = true
+credential-bridge-core.workspace = true
+credential-bridge-proto.workspace = true
+rustix.workspace = true
+
+[lints]
+workspace = true

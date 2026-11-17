@@ -1,0 +1,16 @@
+[package]
+name = "credential-bridge-proto"
+description = "Wire formats shared by the credential-bridge tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true

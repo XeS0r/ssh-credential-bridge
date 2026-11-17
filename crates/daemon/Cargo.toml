@@ -1,0 +1,28 @@
+[package]
+name = "credential-bridged"
+description = "Serves local git credentials to SSH remotes over per-remote unix sockets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+clap_mangen.workspace = true
+credential-bridge-core.workspace = true
+credential-bridge-proto.workspace = true
+rustix.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,54 @@
+# Everything `just check` runs: build, tests, clippy (Linux + macOS), rustfmt,
+# Markdown, static helpers under qemu, the release package and the VM tests.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  # Lets cache-nix-action delete outdated caches (10 GB per repository).
+  actions: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The full check builds the Rust toolchain for four targets, a s390x
+      # cross compiler and five VM images; the runner's 14 GB are not enough.
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force > /dev/null
+          df -h /
+
+      # Also gives the runner user access to /dev/kvm (input enable_kvm,
+      # default true); the VM tests additionally need these system features.
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            system-features = nixos-test benchmark big-parallel kvm
+
+      # Keeps the Nix store between runs, so later runs only rebuild what
+      # changed. Keyed on everything that decides what gets built.
+      - name: Restore and save the Nix store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', 'flake.lock', 'Cargo.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 6G
+          # Pull requests from forks get a read-only token and cannot delete
+          # caches; only pushes clean up.
+          purge: ${{ github.event_name == 'push' }}
+          purge-prefixes: nix-${{ runner.os }}-
+          purge-created: 0
+          purge-last-accessed: P7D
+          purge-primary-key: never
+
+      - run: nix flake check -L
