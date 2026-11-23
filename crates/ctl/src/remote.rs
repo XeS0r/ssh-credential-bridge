@@ -1,876 +1,815 @@
-//! `remote …` and `test` commands.
+//! Reaching servers through the user's own `ssh` (so ssh config, agents and jump hosts
+//! apply). Behind a trait so commands can be tested with a fake.
 
-use std::collections::BTreeMap;
-use std::env;
+use std::fs::File;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
-use std::time::Duration;
+use std::process::{Command, Stdio};
 
-use anyhow::{Context, bail};
-use credential_bridge_core::config::{Config, RemoteConfig, validate_name};
-use credential_bridge_core::paths::{self, HELPER_BINARY};
-use credential_bridge_core::policy::UrlPattern;
-use credential_bridge_proto::client::exchange;
-use credential_bridge_proto::{Credential, Operation, Request, Status};
+use credential_bridge_proto::text::shell_quote;
 
-use crate::ssh::Ssh;
-use crate::ui::{self, Level};
-use crate::util::{sh_quote, socket_state};
-use crate::{AddArgs, Ctx, EditArgs, InstallArgs, RemoteCommand, TestArgs, service};
+/// Output of a remote command.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteOutput {
+    /// Exit code; `None` if ssh itself failed or the command was killed.
+    pub status: Option<i32>,
+    /// Stdout.
+    pub stdout: String,
+    /// Stderr.
+    pub stderr: String,
+}
 
-/// Environment variable naming a directory with prebuilt helpers
-/// (`git-credential-bridge-<arch>-<os>`); set by the Nix package.
-const HELPER_DIR_ENV: &str = "CREDENTIAL_BRIDGE_HELPER_DIR";
-
-pub fn run(ctx: &Ctx, cmd: RemoteCommand) -> anyhow::Result<()> {
-    match cmd {
-        RemoteCommand::Add(args) => add(ctx, args),
-        RemoteCommand::Remove { name } => remove(ctx, &name),
-        RemoteCommand::List => list(ctx),
-        RemoteCommand::Show { name } => show(ctx, &name),
-        RemoteCommand::SshConfig { name } => {
-            let config = ctx.load()?;
-            let remote = find(&config, &name)?;
-            print_ssh_config(&config, remote)
-        }
-        RemoteCommand::Edit(args) => edit(ctx, args),
-        RemoteCommand::Install(args) => install(ctx, &args),
-        RemoteCommand::Check { name } => check(ctx, &name),
-        RemoteCommand::Uninstall { name, dry_run } => uninstall(ctx, &name, dry_run),
+impl RemoteOutput {
+    /// Whether the command exited with 0.
+    pub fn success(&self) -> bool {
+        self.status == Some(0)
     }
-}
 
-fn find<'a>(config: &'a Config, name: &str) -> anyhow::Result<&'a RemoteConfig> {
-    config
-        .remote(name)
-        .with_context(|| format!("no remote named '{name}' (see `credential-bridge-ctl remote list`)"))
-}
-
-fn add(ctx: &Ctx, args: AddArgs) -> anyhow::Result<()> {
-    validate_name(&args.name)?;
-    for pattern in &args.allow {
-        pattern.parse::<UrlPattern>()?;
-    }
-    let operations = if args.operations.is_empty() { vec!["get".to_owned()] } else { args.operations };
-    let remote = RemoteConfig {
-        name: args.name,
-        ssh_host: args.ssh_host,
-        remote_socket: args.remote_socket,
-        allow: args.allow,
-        operations,
-        backend: args.backend,
-    };
-    let mut doc = ctx.document()?;
-    doc.add_remote(&remote)?;
-    doc.save()?;
-    println!("added remote '{}' to {}", remote.name, doc.path().display());
-    service::reload_if_active(ctx);
-    println!();
-    println!("next steps:");
-    println!(
-        "  credential-bridge-ctl remote install {}     # helper + git config on the remote",
-        remote.name
-    );
-    println!("  credential-bridge-ctl remote ssh-config {}  # lines for ~/.ssh/config", remote.name);
-    Ok(())
-}
-
-fn remove(ctx: &Ctx, name: &str) -> anyhow::Result<()> {
-    let mut doc = ctx.document()?;
-    if !doc.remove_remote(name)? {
-        bail!("no remote named '{name}'");
-    }
-    doc.save()?;
-    println!("removed remote '{name}' from {}", doc.path().display());
-    println!("note: the helper stays on the remote; `remote uninstall` removes it (run it before `remove`)");
-    println!("note: remove the RemoteForward line for this remote from ~/.ssh/config");
-    service::reload_if_active(ctx);
-    Ok(())
-}
-
-fn edit(ctx: &Ctx, args: EditArgs) -> anyhow::Result<()> {
-    let config = ctx.load()?;
-    let before = find(&config, &args.name)?.clone();
-
-    let mut allow = before.allow.clone();
-    for pattern in &args.add_allow {
-        pattern.parse::<UrlPattern>()?;
-        if !allow.contains(pattern) {
-            allow.push(pattern.clone());
+    /// A short explanation of a failure: the last non-empty line of stderr, or the
+    /// exit status.
+    pub fn failure_reason(&self) -> String {
+        match self.stderr.lines().rev().map(str::trim).find(|line| !line.is_empty()) {
+            Some(line) => line.to_owned(),
+            None => match self.status {
+                Some(code) => format!("exit status {code}"),
+                None => "killed by a signal".to_owned(),
+            },
         }
     }
-    for pattern in &args.remove_allow {
-        if !allow.contains(pattern) {
-            bail!("'{pattern}' is not in the allow list of '{}': {}", args.name, before.allow.join(", "));
+}
+
+/// Runs things on servers.
+pub trait RemoteShell {
+    /// Runs `argv` on `host` (each argument shell-quoted for the remote shell).
+    fn run(&self, host: &str, argv: &[&str]) -> io::Result<RemoteOutput>;
+    /// Copies a local file to `remote_path` on `host` with mode 0755, atomically
+    /// (upload to a temporary name, then rename).
+    fn install_file(&self, host: &str, local: &Path, remote_path: &str) -> io::Result<()>;
+    /// [`RemoteShell::run`] that also reports the host key ssh accepted for this
+    /// connection (from its debug log; a fresh connection, no connection sharing).
+    /// `None` if ssh did not say. ssh may ask on the terminal about an unknown host key
+    /// and store it in known_hosts.
+    fn run_noting_host_key(
+        &self,
+        host: &str,
+        argv: &[&str],
+    ) -> io::Result<(RemoteOutput, Option<UsedHostKey>)>;
+    /// Runs `credential-bridge-remote query` on `host` with the agent forwarded from
+    /// `forward_socket` (`ForwardAgent` set on the command line, whatever the ssh config
+    /// says; a fresh connection, no connection sharing), so its agent connection reaches
+    /// the daemon. Returns the output and the process id of the local ssh, which the
+    /// daemon's audit log names as the peer of that connection.
+    fn probe(&self, host: &str, forward_socket: &Path) -> io::Result<ProbeRun>;
+    /// The effective client configuration for `host` (`ssh -G` output), for checking
+    /// the user's ssh config. Runs locally; nothing connects.
+    fn ssh_g(&self, host: &str) -> io::Result<String> {
+        check_host(host)?;
+        let output = Command::new("ssh").arg("-G").arg("--").arg(host).stdin(Stdio::null()).output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "ssh -G {host} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
         }
-        allow.retain(|p| p != pattern);
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
-    if allow.is_empty() {
-        bail!("the allow list of '{}' must not become empty", args.name);
+    /// The plain host keys of type `key_type` (an `ssh-keyscan -t` name such as
+    /// `ed25519`) that `hostname` offers on `port`, as `ssh-keyscan` prints them: one
+    /// scan with a 5 second timeout, connecting directly (ssh config, `ProxyJump`
+    /// included, does not apply).
+    fn keyscan(&self, hostname: &str, port: u16, key_type: &str) -> io::Result<String> {
+        check_host(hostname)?;
+        let output = Command::new("ssh-keyscan")
+            .args(["-T", "5", "-t", key_type, "-p", &port.to_string(), "--", hostname])
+            .stdin(Stdio::null())
+            .output()?;
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
-
-    let mut doc = ctx.document()?;
-    let name = &args.name;
-    if allow != before.allow {
-        doc.set_remote_list(name, "allow", &allow)?;
+    /// What the local `ssh -V` prints (ssh writes it to stderr). Runs locally.
+    fn ssh_version(&self) -> io::Result<String> {
+        let output = Command::new("ssh").arg("-V").stdin(Stdio::null()).output()?;
+        let mut text = String::from_utf8_lossy(&output.stderr).into_owned();
+        text.push_str(&String::from_utf8_lossy(&output.stdout));
+        Ok(text)
     }
-    if !args.operations.is_empty() {
-        doc.set_remote_list(name, "operations", &args.operations)?;
-    }
-    if let Some(host) = &args.ssh_host {
-        doc.set_remote_value(name, "ssh_host", host)?;
-        // The recorded socket path lives in the old host's home; the new
-        // one is only known after `remote install` has probed it.
-        if host != before.ssh_target() {
-            doc.remove_remote_value(name, "remote_socket")?;
-        }
-    }
-    if let Some(backend) = &args.backend {
-        doc.set_remote_value(name, "backend", backend)?;
-    }
-    if args.default_backend {
-        doc.remove_remote_value(name, "backend")?;
-    }
-    doc.save()?;
-
-    let config = ctx.load()?;
-    let after = find(&config, name)?;
-    println!("updated remote '{name}' in {}", doc.path().display());
-    print_remote(&config, after)?;
-    service::reload_if_active(ctx);
-
-    if after.remote_socket.is_some() && origins(after)? != origins(&before)? {
-        println!();
-        println!("note: the remote's git configuration covers other hosts now; update it with:");
-        println!("  credential-bridge-ctl remote install {name}");
-    }
-    if after.ssh_target() != before.ssh_target() {
-        println!("note: the ssh destination changed; set it up there with:");
-        println!("  credential-bridge-ctl remote install {name}");
-        println!("  credential-bridge-ctl remote ssh-config {name}   # the RemoteForward for the new host");
-    }
-    Ok(())
 }
 
-fn list(ctx: &Ctx) -> anyhow::Result<()> {
-    let config = ctx.load()?;
-    if config.remotes.is_empty() {
-        println!("no remotes configured");
-        println!("{}", ui::fix(2, "credential-bridge-ctl remote add NAME --allow https://github.com/ORG/*"));
-        return Ok(());
+/// The host key ssh accepted for a connection, as its debug log names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsedHostKey {
+    /// The key type, e.g. `ssh-ed25519` (for a host certificate the type of the key in
+    /// it).
+    pub algorithm: String,
+    /// `SHA256:…` of the key (for a host certificate, of the key in it).
+    pub fingerprint: String,
+    /// Whether the server presented a host certificate.
+    pub certificate: bool,
+    /// Where ssh found the key, or the CA that signed the certificate, in known_hosts;
+    /// `None` if it did not (an unknown or changed key ssh accepted anyway, e.g. with
+    /// `StrictHostKeyChecking=no`).
+    pub verified: Option<KnownHostsMatch>,
+}
+
+/// The known_hosts entry ssh verified a host key with, as its debug log names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownHostsMatch {
+    /// Whether it is a `@cert-authority` line that signed the host certificate
+    /// (`Found CA key in …`), else a host line with the key itself (`Found key in …`).
+    pub authority: bool,
+    /// The file, as ssh names it.
+    pub file: PathBuf,
+}
+
+impl UsedHostKey {
+    /// `ssh-ed25519 SHA256:…`.
+    pub fn describe(&self) -> String {
+        format!("{} {}", self.algorithm, self.fingerprint)
     }
-    let name_width = config.remotes.iter().map(|r| r.name.chars().count()).max().unwrap_or(0);
-    let dest_width = config.remotes.iter().map(|r| r.ssh_target().chars().count() + 2).max().unwrap_or(0);
-    for remote in &config.remotes {
-        let listening = matches!(
-            config.socket_path(&remote.name).map(|s| socket_state(&s)),
-            Ok(crate::util::SocketState::Listening)
-        );
-        let forward = forward_status(&config, remote).is_ok_and(|s| s == ForwardStatus::Configured);
-        let installed = remote.remote_socket.is_some();
-        let ready = listening && forward && installed;
-        let level = if ready {
-            Level::Ok
-        } else if listening {
-            Level::Warn
-        } else {
-            Level::Fail
-        };
-        let allow: Vec<&str> = remote.allow.iter().map(|a| ui::short_url(a)).collect();
-        let state = if ready {
-            String::new()
-        } else {
-            format!("   {} {}", ui::red("not ready"), ui::dim("(doctor)"))
-        };
-        println!(
-            "{} {}  {}  {}{state}",
-            level.dot(),
-            ui::pad(&remote.name, name_width),
-            ui::dim(&ui::pad(&format!("→ {}", remote.ssh_target()), dest_width)),
-            allow.join(", ")
-        );
-    }
-    Ok(())
 }
 
-fn show(ctx: &Ctx, name: &str) -> anyhow::Result<()> {
-    let config = ctx.load()?;
-    print_remote(&config, find(&config, name)?)
+/// What [`RemoteShell::probe`] returns.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProbeRun {
+    /// The output of `credential-bridge-remote query` (and ssh's errors).
+    pub output: RemoteOutput,
+    /// The process id of the local ssh.
+    pub pid: Option<u32>,
 }
 
-fn print_remote(config: &Config, remote: &RemoteConfig) -> anyhow::Result<()> {
-    let name = &remote.name;
-    let socket = config.socket_path(name)?;
-    println!("remote {name}");
-    println!("  ssh destination: {}", remote.ssh_target());
-    println!("  allow:           {}", remote.allow.join(", "));
-    println!("  operations:      {}", remote.operations.join(", "));
-    println!("  backend:         {}", remote.backend.as_deref().unwrap_or(&config.backend));
-    println!("  local socket:    {} ({})", socket.display(), socket_state(&socket));
-    match &remote.remote_socket {
-        Some(path) => println!("  remote socket:   {path}"),
-        None => println!("  remote socket:   unknown (run `credential-bridge-ctl remote install {name}`)"),
-    }
-    Ok(())
-}
-
-/// Quotes a path for ssh_config if needed.
-fn ssh_config_quote(path: &str) -> String {
-    if path.contains(char::is_whitespace) { format!("\"{path}\"") } else { path.to_owned() }
-}
-
-fn print_ssh_config(config: &Config, remote: &RemoteConfig) -> anyhow::Result<()> {
-    let local = config.socket_path(&remote.name)?;
-    let remote_socket = match &remote.remote_socket {
-        Some(path) => path.clone(),
-        None => {
-            eprintln!(
-                "note: the socket path on the remote is not known yet; run \
-                 `credential-bridge-ctl remote install {}` first, or replace <REMOTE_HOME> below",
-                remote.name
-            );
-            paths::default_remote_socket("<REMOTE_HOME>")
-        }
-    };
-    let host = remote.ssh_target().rsplit('@').next().unwrap_or(remote.ssh_target());
-    println!("# credential-bridge: forward the socket of remote '{}'", remote.name);
-    println!("Host {host}");
-    println!(
-        "    RemoteForward {} {}",
-        ssh_config_quote(&remote_socket),
-        ssh_config_quote(&local.to_string_lossy())
-    );
-    eprintln!(
-        "note: if this Host already has an entry in ~/.ssh/config, add only the RemoteForward line to it"
-    );
-    eprintln!(
-        "note: the remote's sshd should set `StreamLocalBindUnlink yes`; otherwise a stale socket \
-         left by an earlier connection blocks the forwarding"
-    );
-    Ok(())
-}
-
-/// Directories that may hold prebuilt helpers (`git-credential-bridge-<platform>`),
-/// in this order:
+/// [`RemoteShell`] with the `ssh` program in `PATH`.
 ///
-/// 1. `$CREDENTIAL_BRIDGE_HELPER_DIR` (set by the Nix package's wrapper)
-/// 2. `<prefix>/share/credential-bridge/helpers` next to this program's `bin/`,
-///    as the path it was started by and with symlinks resolved (release
-///    packages, `install.sh`, distribution packages)
-/// 3. `$XDG_DATA_HOME/credential-bridge/helpers` (helpers put there by hand)
-pub fn helper_dirs() -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = env::var_os(HELPER_DIR_ENV).map(PathBuf::from).into_iter().collect();
-    let invoked = service::invoked_path(env::args_os().next().map(PathBuf::from), crate::util::which);
-    for exe in [invoked, env::current_exe().ok()].into_iter().flatten() {
-        if let Some(prefix) = exe.parent().and_then(Path::parent) {
-            dirs.push(prefix.join("share/credential-bridge/helpers"));
+/// Connections disable agent, X11 and port forwarding: nothing ctl runs on a server
+/// needs them, except the probe, which forwards the daemon's forward socket. ssh may
+/// still prompt on the terminal (password, unknown host key).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SshShell;
+
+/// Options for every ctl connection.
+const SSH_OPTIONS: &[&str] = &["-T", "-a", "-x", "-o", "ClearAllForwardings=yes"];
+
+/// Script that installs stdin as `$1`: temporary file next to it, mode 0755, rename.
+/// Kept free of backslashes so the quoting works in fish as well as POSIX shells.
+const INSTALL_SCRIPT: &str = r#"set -e
+umask 077
+mkdir -p "$(dirname "$1")"
+t="$1.tmp.$$"
+trap 'rm -f "$t"' EXIT
+cat > "$t"
+chmod 755 "$t"
+mv -f "$t" "$1"
+trap - EXIT"#;
+
+/// Options for a connection that must make its own key exchange: no connection sharing
+/// (a shared connection would neither show the host key nor forward the agent of this
+/// command line) and fingerprints in SHA256.
+const FRESH_CONNECTION: &[&str] = &["-S", "none", "-o", "FingerprintHash=sha256"];
+
+impl SshShell {
+    fn ssh(host: &str, argv: &[&str]) -> io::Result<Command> {
+        check_host(host)?;
+        let mut command = Command::new("ssh");
+        command.args(SSH_OPTIONS).arg("--").arg(host).arg(remote_command(argv));
+        Ok(command)
+    }
+}
+
+/// A private temporary file for ssh's debug log (`ssh -E`), removed when dropped.
+fn debug_log() -> io::Result<tempfile::NamedTempFile> {
+    tempfile::Builder::new().prefix("credential-bridge-ssh-").suffix(".log").tempfile()
+}
+
+/// The output of a finished ssh whose own messages went to `log` (`ssh -E`): ssh's
+/// messages other than debug lines are appended to stderr, so failures keep their
+/// reason.
+fn output_with_log(output: std::process::Output, log: &str) -> RemoteOutput {
+    let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    for line in log.lines().filter(|line| !line.starts_with("debug")) {
+        stderr.push_str(line);
+        stderr.push('\n');
+    }
+    RemoteOutput {
+        status: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr,
+    }
+}
+
+/// `ForwardAgent=<path>` for the ssh command line: `%` doubled (ssh expands `%` tokens
+/// in the path) and the value quoted if it has spaces.
+fn forward_agent_option(path: &Path) -> String {
+    let path = path.display().to_string().replace('%', "%%");
+    if path.contains(char::is_whitespace) {
+        format!("ForwardAgent=\"{path}\"")
+    } else {
+        format!("ForwardAgent={path}")
+    }
+}
+
+impl RemoteShell for SshShell {
+    fn run(&self, host: &str, argv: &[&str]) -> io::Result<RemoteOutput> {
+        let output = Self::ssh(host, argv)?.stdin(Stdio::null()).output()?;
+        Ok(RemoteOutput {
+            status: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+
+    fn install_file(&self, host: &str, local: &Path, remote_path: &str) -> io::Result<()> {
+        let file = File::open(local)?;
+        let output = Self::ssh(host, &["sh", "-c", INSTALL_SCRIPT, "sh", remote_path])?
+            .stdin(Stdio::from(file))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let result = RemoteOutput {
+            status: output.status.code(),
+            stdout: String::new(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        };
+        Err(io::Error::other(format!("uploading to {remote_path} failed: {}", result.failure_reason())))
+    }
+
+    fn run_noting_host_key(
+        &self,
+        host: &str,
+        argv: &[&str],
+    ) -> io::Result<(RemoteOutput, Option<UsedHostKey>)> {
+        check_host(host)?;
+        let log = debug_log()?;
+        let output = Command::new("ssh")
+            .args(SSH_OPTIONS)
+            .args(FRESH_CONNECTION)
+            .arg("-v")
+            .arg("-E")
+            .arg(log.path())
+            .arg("--")
+            .arg(host)
+            .arg(remote_command(argv))
+            .stdin(Stdio::null())
+            .output()?;
+        let text = std::fs::read_to_string(log.path()).unwrap_or_default();
+        Ok((output_with_log(output, &text), used_host_key(&text)))
+    }
+
+    fn probe(&self, host: &str, forward_socket: &Path) -> io::Result<ProbeRun> {
+        check_host(host)?;
+        let log = debug_log()?;
+        let child = Command::new("ssh")
+            .args(["-T", "-x", "-o", "ClearAllForwardings=yes"])
+            .args(FRESH_CONNECTION)
+            .arg("-o")
+            .arg(forward_agent_option(forward_socket))
+            .arg("-E")
+            .arg(log.path())
+            .arg("--")
+            .arg(host)
+            .arg(remote_command(&[REMOTE_BINARY, "query"]))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let pid = Some(child.id());
+        let output = child.wait_with_output()?;
+        let text = std::fs::read_to_string(log.path()).unwrap_or_default();
+        Ok(ProbeRun { output: output_with_log(output, &text), pid })
+    }
+}
+
+/// The text of a debug log line after its first `:` (`debug1: <text>`). Phrases are
+/// matched at its start only: text a server controls (its version, `Remote:` messages,
+/// banner lines) never starts there.
+fn log_text(line: &str) -> Option<&str> {
+    Some(line.trim_start_matches(|c: char| c != ':').strip_prefix(':')?.trim_start())
+}
+
+/// The host key in ssh's debug log: `Server host key: <type> <fingerprint>`, or for a
+/// host certificate `Server host certificate: <type>-cert-v01@openssh.com
+/// <fingerprint>, …` (the fingerprint is that of the key in the certificate), with
+/// [`known_hosts_match`].
+pub fn used_host_key(log: &str) -> Option<UsedHostKey> {
+    log.lines().find_map(|line| {
+        let line = log_text(line)?;
+        let (rest, certificate) = match line.strip_prefix("Server host key: ") {
+            Some(rest) => (rest, false),
+            None => (line.strip_prefix("Server host certificate: ")?, true),
+        };
+        let mut fields = rest.split_whitespace();
+        let algorithm = fields.next()?;
+        let fingerprint = fields.next()?.trim_end_matches(',');
+        let algorithm = algorithm.strip_suffix("-cert-v01@openssh.com").unwrap_or(algorithm);
+        fingerprint.starts_with("SHA256:").then(|| UsedHostKey {
+            algorithm: algorithm.to_owned(),
+            fingerprint: fingerprint.to_owned(),
+            certificate,
+            verified: known_hosts_match(log),
+        })
+    })
+}
+
+/// Where ssh found the host key in known_hosts, from its debug log: `Found key in
+/// <file>:<line>`, or for a host certificate `Found CA key in <file>:<line>` (OpenSSH's
+/// `check_host_key`, debug1). ssh logs it only when known_hosts vouches for the key: not
+/// for a new key it accepts (asked, `accept-new` or `StrictHostKeyChecking=no`), nor a
+/// changed one it accepts anyway, nor a certificate whose CA it does not know (`No
+/// matching CA found. Retry with plain key`, after which a plain `Found key` may follow).
+pub fn known_hosts_match(log: &str) -> Option<KnownHostsMatch> {
+    log.lines().find_map(|line| {
+        let text = log_text(line)?;
+        let (rest, authority) = match text.strip_prefix("Found key in ") {
+            Some(rest) => (rest, false),
+            None => (text.strip_prefix("Found CA key in ")?, true),
+        };
+        let (file, number) = rest.rsplit_once(':')?;
+        number.parse::<u64>().ok()?;
+        Some(KnownHostsMatch { authority, file: PathBuf::from(file) })
+    })
+}
+
+/// Refuses host names ssh would read as an option.
+fn check_host(host: &str) -> io::Result<()> {
+    if host.is_empty() || host.starts_with('-') || host.chars().any(char::is_whitespace) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid ssh host {host:?}")));
+    }
+    Ok(())
+}
+
+/// The command line ssh sends: every argument quoted, joined by spaces.
+pub fn remote_command(argv: &[&str]) -> String {
+    argv.iter().map(|arg| shell_quote(arg)).collect::<Vec<_>>().join(" ")
+}
+
+/// What `ssh -G` says about where a host is, which known_hosts files apply and whether
+/// ssh learns new host keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshTarget {
+    hostname: String,
+    port: u16,
+    host_key_alias: Option<String>,
+    update_host_keys: Option<String>,
+    /// `userknownhostsfile` and `globalknownhostsfile` lines: option and value.
+    known_hosts: Vec<(String, String)>,
+}
+
+/// At most this many `/`-tokens after the first on one known_hosts line are told apart
+/// (each may start a file or continue a path with " /" in it).
+const MAX_PATH_STARTS: usize = 8;
+
+impl SshTarget {
+    /// Parses `ssh -G` output.
+    pub fn parse(ssh_g: &str) -> SshTarget {
+        let mut target = SshTarget {
+            hostname: String::new(),
+            port: 22,
+            host_key_alias: None,
+            update_host_keys: None,
+            known_hosts: Vec::new(),
+        };
+        // ssh -G prints `key value` with one space and the value as it is: paths keep
+        // their spaces and tabs, trailing ones included. Only the line end goes.
+        for line in ssh_g.split('\n') {
+            let Some((key, value)) = line.split_once(' ') else { continue };
+            match key {
+                "hostname" => target.hostname = value.to_owned(),
+                "port" => target.port = value.parse().unwrap_or(22),
+                "hostkeyalias" if value != "none" => target.host_key_alias = Some(value.to_owned()),
+                "updatehostkeys" => target.update_host_keys = Some(value.to_owned()),
+                "userknownhostsfile" | "globalknownhostsfile" => {
+                    target.known_hosts.push((key.to_owned(), value.to_owned()));
+                }
+                _ => {}
+            }
+        }
+        target
+    }
+
+    /// The host name ssh connects to.
+    pub fn hostname(&self) -> &str {
+        &self.hostname
+    }
+
+    /// The port ssh connects to.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// The name ssh looks up in known_hosts: `HostKeyAlias`, else the host name, as
+    /// `[host]:port` for a port other than 22; lowercase, as ssh lowercases both.
+    pub fn lookup_name(&self) -> String {
+        let name = match &self.host_key_alias {
+            Some(alias) => alias.clone(),
+            None if self.port == 22 => self.hostname.clone(),
+            None => format!("[{}]:{}", self.hostname, self.port),
+        };
+        name.to_ascii_lowercase()
+    }
+
+    /// Whether ssh learns the server's new host keys at login (`UpdateHostKeys`): `false`
+    /// only if `ssh -G` says it is off, which OpenSSH does on its own when
+    /// `UserKnownHostsFile` is set or `VerifyHostKeyDNS` is on.
+    pub fn updates_host_keys(&self) -> bool {
+        !matches!(self.update_host_keys.as_deref(), Some("false" | "no"))
+    }
+
+    /// The known_hosts files ssh reads for this host (`UserKnownHostsFile`, then
+    /// `GlobalKnownHostsFile`). Without any in the output: OpenSSH's defaults in `home`.
+    ///
+    /// `ssh -G` has expanded `~` and `%` tokens and prints each list unquoted, the files
+    /// joined by exactly one space (OpenSSH 10.2; other whitespace in a path is printed
+    /// as it is). Split at each single space, every file starts with `/`: a token without
+    /// one (empty ones included, from two spaces in a row or a trailing space) continues
+    /// the path before it. A token with `/` may start a file or continue a path
+    /// containing " /"; of the possible readings the one whose files all exist wins,
+    /// else the one whose files all have an existing directory, else each such token
+    /// starts a file. Errors: a relative path, an unexpanded `%` token, or readings that
+    /// cannot be told apart.
+    pub fn known_hosts_files(&self, home: &Path) -> Result<Vec<PathBuf>, String> {
+        if self.known_hosts.is_empty() {
+            return Ok(credential_bridge_config::known_hosts::default_files(home));
+        }
+        let mut files = Vec::new();
+        for (option, value) in &self.known_hosts {
+            files.extend(split_paths(option, value)?);
+        }
+        Ok(files)
+    }
+}
+
+/// The files of one `ssh -G` known_hosts line; see [`SshTarget::known_hosts_files`].
+fn split_paths(option: &str, value: &str) -> Result<Vec<PathBuf>, String> {
+    let line = format!("ssh -G prints `{option} {value}`");
+    if value.is_empty() || value == "none" {
+        return Ok(Vec::new());
+    }
+    let tokens: Vec<&str> = value.split(' ').collect();
+    if let Some(token) = tokens.iter().find(|token| token.contains('%')) {
+        return Err(format!(
+            "{line}: {token:?} holds a % token ssh did not expand; write the path out in ~/.ssh/config"
+        ));
+    }
+    if !tokens[0].starts_with('/') {
+        return Err(format!(
+            "{line}: {:?} is a relative path, which ssh reads from the current directory; make it \
+             absolute in ~/.ssh/config",
+            tokens[0]
+        ));
+    }
+    let starts: Vec<usize> = tokens
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter(|(_, token)| token.starts_with('/'))
+        .map(|(i, _)| i)
+        .collect();
+    if starts.len() > MAX_PATH_STARTS {
+        return Err(format!("{line}: more than {} files on one line", MAX_PATH_STARTS + 1));
+    }
+    // Bit j of `mask` set: the token at starts[j] starts a file.
+    let reading = |mask: usize| -> Vec<PathBuf> {
+        let mut paths: Vec<String> = Vec::new();
+        for (i, token) in tokens.iter().enumerate() {
+            let starts_file =
+                i == 0 || starts.iter().position(|&start| start == i).is_some_and(|j| mask & (1 << j) != 0);
+            match paths.last_mut() {
+                Some(path) if !starts_file => {
+                    path.push(' ');
+                    path.push_str(token);
+                }
+                _ => paths.push((*token).to_owned()),
+            }
+        }
+        paths.into_iter().map(PathBuf::from).collect()
+    };
+    let readings: Vec<Vec<PathBuf>> = (0..1usize << starts.len()).map(reading).collect();
+    let tiers: [fn(&Path) -> bool; 2] =
+        [|path| path.exists(), |path| path.exists() || path.parent().is_some_and(Path::is_dir)];
+    for fits in tiers {
+        let fitting: Vec<&Vec<PathBuf>> =
+            readings.iter().filter(|reading| reading.iter().all(|path| fits(path))).collect();
+        match fitting.as_slice() {
+            [] => {}
+            [one] => return Ok((*one).clone()),
+            several => {
+                let listed: Vec<String> = several
+                    .iter()
+                    .map(|reading| {
+                        reading
+                            .iter()
+                            .map(|path| format!("{:?}", path.display().to_string()))
+                            .collect::<Vec<_>>()
+                            .join(" + ")
+                    })
+                    .collect();
+                return Err(format!(
+                    "{line}, which can be read as different files ({}); rename the path with \" /\" in it",
+                    listed.join(" or ")
+                ));
+            }
         }
     }
-    if let Ok(data) = paths::data_home() {
-        dirs.push(data.join("credential-bridge/helpers"));
+    Ok(readings.last().cloned().unwrap_or_default())
+}
+
+/// Where `server add` installs the remote binary, relative to the remote home.
+pub const REMOTE_BINARY: &str = ".local/bin/credential-bridge-remote";
+
+/// Maps `uname -m` output to the bundled static binary's target triple
+/// (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `s390x-unknown-linux-gnu`).
+/// `None` for others. Rust ships no musl standard library for s390x, so that binary links
+/// glibc statically.
+pub fn remote_target(uname_m: &str) -> Option<&'static str> {
+    match uname_m.trim() {
+        "x86_64" | "amd64" => Some("x86_64-unknown-linux-musl"),
+        "aarch64" | "arm64" => Some("aarch64-unknown-linux-musl"),
+        "s390x" => Some("s390x-unknown-linux-gnu"),
+        _ => None,
     }
-    dirs.dedup();
+}
+
+/// Environment variable naming the directory with the bundled remote binaries.
+pub const HELPER_DIR_ENV: &str = "CREDENTIAL_BRIDGE_HELPER_DIR";
+
+/// File name of the bundled remote binary for `target` inside the helper directory.
+pub fn bundled_binary_name(target: &str) -> String {
+    format!("credential-bridge-remote-{target}")
+}
+
+/// Directories searched for bundled remote binaries, in order: `$CREDENTIAL_BRIDGE_HELPER_DIR`,
+/// then `<prefix>/share/credential-bridge/helpers` for the prefix of `exe`
+/// (`<prefix>/bin/credential-bridge-ctl`).
+pub fn helper_dirs(env_dir: Option<&Path>, exe: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(dir) = env_dir.filter(|dir| !dir.as_os_str().is_empty()) {
+        dirs.push(dir.to_owned());
+    }
+    if let Some(prefix) = exe.and_then(Path::parent).and_then(Path::parent) {
+        dirs.push(prefix.join("share/credential-bridge/helpers"));
+    }
     dirs
 }
 
-/// Platforms with a helper in [`helper_dirs`], e.g. `["aarch64-linux", "x86_64-linux"]`.
-pub fn available_helpers() -> Vec<String> {
-    let prefix = format!("{HELPER_BINARY}-");
-    let mut platforms: Vec<String> = helper_dirs()
-        .iter()
-        .filter_map(|dir| std::fs::read_dir(dir).ok())
-        .flatten()
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_str()?.strip_prefix(&prefix).map(str::to_owned))
-        .collect();
-    platforms.sort();
-    platforms.dedup();
-    platforms
-}
-
-/// Finds the helper binary to upload for `platform` (e.g. `x86_64-linux`).
-fn find_helper_binary(platform: &str) -> anyhow::Result<PathBuf> {
-    let file = format!("{HELPER_BINARY}-{platform}");
-    if let Some(found) = helper_dirs().into_iter().map(|dir| dir.join(&file)).find(|c| c.is_file()) {
-        return Ok(found);
-    }
-    let available = available_helpers();
-    bail!(
-        "no {HELPER_BINARY} for {platform} found{}.\n\
-         Use a release package that includes it, put `{file}` into \
-         ~/.local/share/credential-bridge/helpers/, or pass `--binary PATH`.",
-        if available.is_empty() { String::new() } else { format!(" (available: {})", available.join(", ")) }
-    )
-}
-
-/// git config `credential.<origin>` sections for the allow list; `true` if
-/// any pattern of that origin needs the request path. Same rule as the
-/// helper's `setup`, from the shared crate.
-fn origins(remote: &RemoteConfig) -> anyhow::Result<BTreeMap<String, bool>> {
-    Ok(credential_bridge_proto::git_sections(&remote.patterns()?))
-}
-
-/// Uploads the helper from stdin and lets it register itself with git
-/// (`git-credential-bridge setup`), all in one ssh connection.
-fn install_script(helper: &str, remote_socket: &str, allow: &[String], git_config: bool) -> String {
-    let dir = Path::new(helper).parent().map_or("/".into(), |p| p.to_string_lossy().into_owned());
-    let tmp = format!("{helper}.tmp");
-    let mut setup = format!("{} setup --socket {}", sh_quote(helper), sh_quote(remote_socket));
-    if !git_config {
-        setup += " --no-git-config";
-    }
-    for pattern in allow {
-        setup += &format!(" {}", sh_quote(pattern));
-    }
-    format!(
-        "set -eu\nmkdir -p {dir}\ncat > {tmp}\nchmod 755 {tmp}\nmv -f {tmp} {dst}\n{setup}\n",
-        dir = sh_quote(&dir),
-        tmp = sh_quote(&tmp),
-        dst = sh_quote(helper),
-    )
-}
-
-/// Lets the helper remove its git configuration and itself
-/// (`git-credential-bridge uninstall --remove-binary`).
-fn uninstall_script() -> String {
-    format!(
-        "set -eu\nh=\"$HOME\"/{0}\nif [ -x \"$h\" ]; then \"$h\" uninstall --remove-binary; \
-         else echo \"nothing to remove: $h does not exist\"; fi\n",
-        paths::REMOTE_HELPER_RELATIVE
-    )
-}
-
-/// One line of a step list: `✓ connect        detail`.
-fn step_line(level: Level, name: &str, detail: &str) -> String {
-    format!("{} {}  {}", level.symbol(), ui::pad(name, 13), ui::dim(detail))
-}
-
-fn install(ctx: &Ctx, args: &InstallArgs) -> anyhow::Result<()> {
-    let config = ctx.load()?;
-    let remote = find(&config, &args.name)?;
-    let hosts: Vec<String> = origins(remote)?.keys().map(|o| ui::short_url(o).to_owned()).collect();
-    let ssh = Ssh::new(remote.ssh_target());
-
-    let info = ssh.probe()?;
-    let git = info.git_version.as_deref().map_or_else(|| "no git".to_owned(), |v| format!("git {v}"));
-    println!(
-        "{}",
-        step_line(Level::Ok, "connect", &format!("{} · {} · {git}", ssh.target(), info.platform()))
-    );
-
-    let binary = match &args.binary {
-        Some(path) => path.clone(),
-        None => find_helper_binary(&info.platform())?,
-    };
-    if !binary.is_file() {
-        bail!("{} is not a file", binary.display());
-    }
-
-    let helper = paths::default_remote_helper(&info.home);
-    let remote_socket =
-        remote.remote_socket.clone().unwrap_or_else(|| paths::default_remote_socket(&info.home));
-    let git_config = !args.no_git_config && info.git_version.is_some();
-    let script = install_script(&helper, &remote_socket, &remote.allow, git_config);
-
-    if args.dry_run {
-        println!();
-        println!("# run on {} with {} on stdin:", ssh.target(), binary.display());
-        print!("{script}");
-        if remote.remote_socket.is_none() {
-            println!();
-            println!("# then record remote_socket = {remote_socket:?} in {}", ctx.config_path.display());
-        }
-        return Ok(());
-    }
-
-    let output = ssh.run_with_input(&script, &binary)?;
-    let size = std::fs::metadata(&binary)
-        .map(|m| format!(" · {:.1} MB", m.len() as f64 / 1_000_000.0))
-        .unwrap_or_default();
-    let remote_home = Some(info.home.as_str());
-    println!(
-        "{}",
-        step_line(Level::Ok, "upload helper", &format!("{}{size}", ui::tilde(&helper, remote_home)))
-    );
-    if git_config {
-        println!("{}", step_line(Level::Ok, "configure git", &hosts.join(", ")));
-    } else if args.no_git_config {
-        println!("{}", step_line(Level::Ok, "configure git", "skipped (--no-git-config)"));
-    } else {
-        println!("{}", step_line(Level::Warn, "configure git", "skipped: git not found on the remote"));
-    }
-    if ui::verbose() {
-        for line in output.lines() {
-            println!("  {}", ui::dim(line));
-        }
-    }
-
-    if remote.remote_socket.is_none() {
-        let mut doc = ctx.document()?;
-        doc.set_remote_value(&remote.name, "remote_socket", &remote_socket)?;
-        doc.save()?;
-        if ui::verbose() {
-            println!(
-                "  {}",
-                ui::dim(&format!("recorded remote_socket in {}", ui::home_tilde(&ctx.config_path)))
-            );
-        }
-    }
-
-    let config = ctx.load()?;
-    let remote = find(&config, &args.name)?;
-    let status = forward_status(&config, remote)?;
-    let check = format!("credential-bridge-ctl remote check {}", remote.name);
-    if status == ForwardStatus::Configured {
-        println!("{}", step_line(Level::Ok, "ssh config", "RemoteForward present"));
-        println!();
-        println!("{} Check it: {}", ui::green(&ui::bold("Installed.")), ui::cyan(&check));
-    } else {
-        println!("{}", step_line(Level::Warn, "ssh config", &status.to_string()));
-        println!();
-        status.explain(remote);
-        print_ssh_config(&config, remote)?;
-        println!();
-        println!("{} Then reconnect and check it: {}", ui::green(&ui::bold("Installed.")), ui::cyan(&check));
-    }
-    Ok(())
-}
-
-/// Whether the user's ssh config forwards a remote's socket.
-#[derive(Debug, PartialEq)]
-pub enum ForwardStatus {
-    Configured,
-    /// No RemoteForward to our local socket.
-    Missing,
-    /// Forwards our local socket, but to another path on the remote.
-    WrongRemotePath(String),
-    /// `ssh -G` failed.
-    Unknown(String),
-}
-
-impl std::fmt::Display for ForwardStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ForwardStatus::Configured => f.write_str("forwards the socket"),
-            ForwardStatus::Missing => f.write_str("has no RemoteForward for the socket"),
-            ForwardStatus::WrongRemotePath(path) => write!(f, "forwards the socket to {path} on the remote"),
-            ForwardStatus::Unknown(err) => write!(f, "cannot be checked: {err}"),
-        }
-    }
-}
-
-impl ForwardStatus {
-    pub fn explain(&self, remote: &RemoteConfig) {
-        match self {
-            ForwardStatus::Configured => {}
-            ForwardStatus::Missing => {
-                println!("ssh config: no RemoteForward for '{}' yet; add this to ~/.ssh/config:", remote.name)
-            }
-            ForwardStatus::WrongRemotePath(path) => println!(
-                "ssh config: the RemoteForward for '{}' points to {path} on the remote; replace it with:",
-                remote.name
-            ),
-            ForwardStatus::Unknown(err) => {
-                println!("ssh config: cannot check ({err}); make sure ~/.ssh/config contains:")
-            }
-        }
-    }
-}
-
-/// Checks the RemoteForward of `remote` with `ssh -G`. Without a recorded
-/// remote socket (not installed yet) only the local end is compared.
-pub fn forward_status(config: &Config, remote: &RemoteConfig) -> anyhow::Result<ForwardStatus> {
-    let local = config.socket_path(&remote.name)?;
-    let forwards = match Ssh::new(remote.ssh_target()).configured_forwards() {
-        Ok(forwards) => forwards,
-        Err(err) => return Ok(ForwardStatus::Unknown(format!("{err:#}"))),
-    };
-    Ok(match_forward(&forwards, &local.to_string_lossy(), remote.remote_socket.as_deref()))
-}
-
-fn match_forward(forwards: &[String], local: &str, remote_socket: Option<&str>) -> ForwardStatus {
-    // `<listen> <connect>`: find the line that ends with our local socket;
-    // whatever comes before it is the path on the remote, spaces included.
-    let unquote = |s: &str| s.trim().trim_matches('"').to_owned();
-    let listen = forwards.iter().find_map(|line| {
-        let line = line.trim();
-        line.strip_suffix(local)
-            .or_else(|| line.strip_suffix(&format!("\"{local}\"")))
-            .filter(|rest| rest.ends_with(char::is_whitespace))
-            .map(unquote)
-    });
-    let Some(listen) = listen else {
-        return ForwardStatus::Missing;
-    };
-    match remote_socket {
-        Some(expected) if listen != expected => ForwardStatus::WrongRemotePath(listen),
-        _ => ForwardStatus::Configured,
-    }
-}
-
-/// A station of the chain `remote check` walks.
-#[derive(Debug, Clone, PartialEq)]
-enum Station {
-    Ok,
-    Broken { problem: String, fix: String },
-    Unchecked,
-}
-
-const STATIONS: [&str; 5] = ["daemon", "ssh config", "ssh", "helper", "git"];
-
-/// `daemon ━ ssh config ━ ssh ━ helper ━ git    ready`, with the broken
-/// station in red and unchecked ones dimmed.
-fn render_chain(stations: &[Station; 5]) -> String {
-    let mut out = String::new();
-    for (i, (name, station)) in STATIONS.iter().zip(stations).enumerate() {
-        if i > 0 {
-            let link = if *station == Station::Unchecked {
-                ui::dim(" ┄ ")
-            } else {
-                format!(" {} ", ui::green("━"))
-            };
-            out += &link;
-        }
-        out += &match station {
-            Station::Ok => (*name).to_owned(),
-            Station::Broken { .. } => ui::red(&ui::bold(name)),
-            Station::Unchecked => ui::dim(name),
-        };
-    }
-    let ready = stations.iter().all(|s| *s == Station::Ok);
-    out + "    " + &if ready { ui::green(&ui::bold("ready")) } else { ui::red(&ui::bold("broken")) }
-}
-
-/// `remote check`: the whole chain, from the remote's point of view.
-fn check(ctx: &Ctx, name: &str) -> anyhow::Result<()> {
-    let config = ctx.load()?;
-    let remote = find(&config, name)?;
-    let mut stations = [Station::Ok, Station::Ok, Station::Ok, Station::Ok, Station::Ok];
-    let mut detail = Vec::new();
-    let install = format!("credential-bridge-ctl remote install {name}");
-    let broken = |problem: String, fix: String| Station::Broken { problem, fix };
-
-    let run = (|| -> anyhow::Result<()> {
-        let local = config.socket_path(name)?;
-        if !matches!(socket_state(&local), crate::util::SocketState::Listening) {
-            stations[0] = broken(
-                "the local daemon does not serve this remote".into(),
-                "credential-bridge-ctl service reload".into(),
-            );
-            return Ok(());
-        }
-        let status = forward_status(&config, remote)?;
-        if status != ForwardStatus::Configured {
-            stations[1] = broken(
-                format!("ssh config {status}"),
-                format!("credential-bridge-ctl remote ssh-config {name}"),
-            );
-            return Ok(());
-        }
-        let Some(remote_socket) = &remote.remote_socket else {
-            stations[2] = Station::Unchecked;
-            stations[3] = broken("not installed on the remote".into(), install.clone());
-            return Ok(());
-        };
-        // An open session may already forward the socket; connecting with our
-        // own forwarding would take it over (StreamLocalBindUnlink) and remove
-        // it when we disconnect, so try without forwarding first.
-        let ssh = Ssh::new(remote.ssh_target());
-        let script = check_script(remote_socket);
-        let first = match ssh.run_without_forwarding(&script) {
-            Ok(result) => result,
-            Err(err) => {
-                stations[2] = broken(format!("{err:#}"), format!("ssh {}", remote.ssh_target()));
-                return Ok(());
-            }
-        };
-        let first_report = CheckReport::parse(&first.1);
-        let (reached, output, via) = match after_first_run(first.0, &first_report) {
-            NextStep::Reached => (true, first.1, "an open ssh session"),
-            // A forwarding cannot fix a missing helper or git config, and it
-            // would take over (and on disconnect remove) the socket of a
-            // session that is open right now.
-            NextStep::Report => (false, first.1, "a connection without forwarding"),
-            NextStep::Forward => match ssh.run_forwarded(&script) {
-                Ok((ok, output)) => (ok, output, "a new ssh connection"),
-                // sshd could not bind the socket path: usually a stale socket
-                // from an earlier connection without StreamLocalBindUnlink.
-                Err(err) if format!("{err:#}").contains("forwarding failed") => {
-                    stations[2] = broken(
-                        format!("sshd cannot create {remote_socket} on the remote (stale socket?)"),
-                        format!(
-                            "set `StreamLocalBindUnlink yes` in the remote's sshd_config, or: ssh {} rm {}",
-                            remote.ssh_target(),
-                            sh_quote(remote_socket)
-                        ),
-                    );
-                    return Ok(());
-                }
-                Err(err) => return Err(err),
-            },
-        };
-        detail.push(format!("via {via}"));
-        let report = CheckReport::parse(&output);
-        if !report.helper {
-            stations[3] = broken("the helper is missing on the remote".into(), install.clone());
-            stations[4] = Station::Unchecked;
-            return Ok(());
-        }
-        if report.git_entries == 0 {
-            stations[4] = broken("git on the remote does not use the helper".into(), install.clone());
-            return Ok(());
-        }
-        if !reached {
-            stations[2] = broken(
-                format!("the forwarded socket does not reach the daemon: {}", report.ping.trim()),
-                "set `StreamLocalBindUnlink yes` in the remote's sshd_config, then reconnect".into(),
-            );
-        }
-        Ok(())
-    })();
-    run?;
-
-    // Everything after the first broken station is unchecked.
-    if let Some(first) = stations.iter().position(|s| matches!(s, Station::Broken { .. })) {
-        for station in stations.iter_mut().skip(first + 1) {
-            if *station == Station::Ok {
-                *station = Station::Unchecked;
-            }
-        }
-    }
-    println!("{}", render_chain(&stations));
-    if ui::verbose() && !detail.is_empty() {
-        println!("  {}", ui::dim(&detail.join(" · ")));
-    }
-    for station in &stations {
-        if let Station::Broken { problem, fix } = station {
-            println!("  {} {problem}", Level::Fail.symbol());
-            println!("{}", ui::fix(4, fix));
-            bail!("{name} is not ready");
-        }
-    }
-    Ok(())
-}
-
-/// Runs on the remote for `remote check`: helper present, git entries, ping.
-fn check_script(remote_socket: &str) -> String {
-    format!(
-        "h=\"$HOME\"/{helper}; if [ -x \"$h\" ]; then echo helper=yes; else echo helper=no; exit 3; fi; \
-         echo \"git-entries=$(git config --global --get-regexp '^credential\\..*\\.helper$' 2>/dev/null | grep -c {name})\"; \
-         \"$h\" --socket {socket} ping",
-        helper = paths::REMOTE_HELPER_RELATIVE,
-        name = HELPER_BINARY,
-        socket = sh_quote(remote_socket),
-    )
-}
-
-/// What `check` does after its first run, which has no forwarding.
-#[derive(Debug, PartialEq)]
-enum NextStep {
-    /// An open session forwards the socket and the daemon answered.
-    Reached,
-    /// Helper or git config is missing; report that without forwarding.
-    Report,
-    /// Everything is installed but nothing forwards the socket: try with ours.
-    Forward,
-}
-
-fn after_first_run(ok: bool, report: &CheckReport) -> NextStep {
-    if ok {
-        NextStep::Reached
-    } else if !report.helper || report.git_entries == 0 {
-        NextStep::Report
-    } else {
-        NextStep::Forward
-    }
-}
-
-#[derive(Debug, Default, PartialEq)]
-struct CheckReport {
-    helper: bool,
-    git_entries: usize,
-    /// Output of `ping` (and anything else).
-    ping: String,
-}
-
-impl CheckReport {
-    fn parse(output: &str) -> Self {
-        let mut report = CheckReport::default();
-        for line in output.lines() {
-            if let Some(v) = line.strip_prefix("helper=") {
-                report.helper = v.trim() == "yes";
-            } else if let Some(v) = line.strip_prefix("git-entries=") {
-                report.git_entries = v.trim().parse().unwrap_or(0);
-            } else {
-                report.ping += line;
-                report.ping.push('\n');
-            }
-        }
-        report
-    }
-}
-
-fn uninstall(ctx: &Ctx, name: &str, dry_run: bool) -> anyhow::Result<()> {
-    let config = ctx.load()?;
-    let remote = find(&config, name)?;
-    let ssh = Ssh::new(remote.ssh_target());
-    let script = uninstall_script();
-    if dry_run {
-        println!("# run on {}:", ssh.target());
-        print!("{script}");
-        return Ok(());
-    }
-    let output = ssh.run_script(&script)?;
-    if output.contains("nothing to remove") {
-        println!("{} nothing to remove on {}", Level::Ok.symbol(), ssh.target());
-    } else {
-        let hosts = output
-            .lines()
-            .find_map(|l| l.strip_prefix("removed the git configuration for "))
-            .unwrap_or("its hosts");
-        println!(
-            "{} removed the helper from {}  {}",
-            Level::Ok.symbol(),
-            ssh.target(),
-            ui::dim(&format!("git config for {hosts}"))
-        );
-    }
-    if ui::verbose() {
-        output.lines().for_each(|line| println!("  {}", ui::dim(line)));
-    }
-    println!(
-        "{}",
-        ui::dim(&format!(
-            "the remote stays configured locally; `credential-bridge-ctl remote remove {name}` drops it"
-        ))
-    );
-    Ok(())
-}
-
-pub fn test(ctx: &Ctx, args: &TestArgs) -> anyhow::Result<ExitCode> {
-    let config = ctx.load()?;
-    find(&config, &args.remote)?;
-    let socket = config.socket_path(&args.remote)?;
-    let operation: Operation = args.operation.parse()?;
-    let credential = Credential::from_url(&args.url)?;
-    println!("socket:  {}", socket.display());
-    println!("request: {operation} {}", credential.redacted());
-    let response = exchange(&socket, &Request::new(operation, credential), Some(Duration::from_secs(60)))
-        .context("is the service running? (`credential-bridge-ctl service status`)")?;
-    let message = response.message.as_deref().map(|m| format!(" ({m})")).unwrap_or_default();
-    match response.status {
-        Status::Ok if response.credential.is_empty() && operation == Operation::Get => {
-            println!("result:  ok{message}, but the backend has no credential for this URL");
-        }
-        Status::Ok => println!("result:  ok{message} {}", response.credential.redacted()),
-        Status::Denied => println!("result:  denied{message}"),
-        Status::Error => println!("result:  error{message}"),
-    }
-    Ok(if response.status == Status::Ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+/// The bundled binary for `target` in the first of `dirs` that has it.
+pub fn find_bundled_binary(dirs: &[PathBuf], target: &str) -> Option<PathBuf> {
+    let name = bundled_binary_name(target);
+    dirs.iter().map(|dir| dir.join(&name)).find(|path| path.is_file())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn remote(allow: &[&str]) -> RemoteConfig {
-        RemoteConfig {
-            name: "r".into(),
-            ssh_host: None,
-            remote_socket: None,
-            allow: allow.iter().map(|s| s.to_string()).collect(),
-            operations: vec!["get".into()],
-            backend: None,
+    #[test]
+    fn remote_command_quotes_every_argument() {
+        assert_eq!(remote_command(&["echo", "a;b", "c"]), "echo 'a;b' c");
+        assert_eq!(
+            remote_command(&[".local/bin/credential-bridge-remote", "setup", "--host", "it's"]),
+            r".local/bin/credential-bridge-remote setup '--host' 'it'\''s'"
+        );
+    }
+
+    #[test]
+    fn install_script_has_no_backslashes() {
+        assert!(!INSTALL_SCRIPT.contains('\\'));
+    }
+
+    #[test]
+    fn refuses_option_like_hosts() {
+        assert!(check_host("-oProxyCommand=x").is_err());
+        assert!(check_host("").is_err());
+        assert!(check_host("a b").is_err());
+        assert!(check_host("buildserver").is_ok());
+    }
+
+    #[test]
+    fn parses_ssh_g() {
+        let target = SshTarget::parse(
+            "host buildserver\nhostname build.example.com\nport 2222\n\
+             userknownhostsfile ~/.ssh/known_hosts ~/.ssh/known_hosts2\n\
+             globalknownhostsfile /etc/ssh/ssh_known_hosts none\nhostkeyalias none\n",
+        );
+        assert_eq!(target.hostname, "build.example.com");
+        assert_eq!(target.port, 2222);
+        assert_eq!(target.lookup_name(), "[build.example.com]:2222");
+        assert!(target.updates_host_keys());
+        let aliased =
+            SshTarget::parse("hostname 10.0.0.1\nport 22\nhostkeyalias Build\nupdatehostkeys false\n");
+        assert_eq!(aliased.lookup_name(), "build");
+        assert!(!aliased.updates_host_keys());
+        assert!(SshTarget::parse("updatehostkeys ask\n").updates_host_keys());
+        assert_eq!(SshTarget::parse("hostname H\nport 22\n").lookup_name(), "h");
+    }
+
+    /// `ssh -G` prints paths unquoted: a token without `/` continues the path before it.
+    #[test]
+    fn known_hosts_paths_with_spaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().display().to_string();
+        std::fs::create_dir_all(dir.path().join("a b")).unwrap();
+        std::fs::create_dir_all(dir.path().join("u")).unwrap();
+        let files = |line: &str| SshTarget::parse(line).known_hosts_files(Path::new("/home/me"));
+        assert_eq!(
+            files(&format!("userknownhostsfile {root}/a b/kh {root}/u/x\nglobalknownhostsfile none\n"))
+                .unwrap(),
+            [dir.path().join("a b/kh"), dir.path().join("u/x")]
+        );
+        // Nothing exists: each `/` token starts a file.
+        assert_eq!(
+            files("globalknownhostsfile /nonexistent/a /nonexistent/b\n").unwrap(),
+            [PathBuf::from("/nonexistent/a"), PathBuf::from("/nonexistent/b")]
+        );
+
+        let error = files("userknownhostsfile known_hosts /etc/ssh/x\n").unwrap_err();
+        assert!(error.contains("\"known_hosts\" is a relative path"), "{error}");
+        assert!(error.starts_with("ssh -G prints `userknownhostsfile known_hosts /etc/ssh/x`"), "{error}");
+        let error = files("userknownhostsfile %d/x\n").unwrap_err();
+        assert!(error.contains("\"%d/x\" holds a % token"), "{error}");
+
+        // A path with " /" in it: the reading whose files exist wins …
+        let odd = dir.path().join(format!("odd {root}/kh"));
+        std::fs::create_dir_all(odd.parent().unwrap()).unwrap();
+        std::fs::write(&odd, "").unwrap();
+        let line = format!("userknownhostsfile {root}/odd {root}/kh\n");
+        assert_eq!(files(&line).unwrap(), std::slice::from_ref(&odd));
+        // … and if both readings exist, they cannot be told apart.
+        std::fs::write(dir.path().join("odd"), "").unwrap();
+        std::fs::write(dir.path().join("kh"), "").unwrap();
+        let error = files(&line).unwrap_err();
+        assert!(error.contains("which can be read as different files"), "{error}");
+        assert!(
+            error.starts_with(&format!("ssh -G prints `userknownhostsfile {root}/odd {root}/kh`")),
+            "{error}"
+        );
+    }
+
+    /// ssh joins the files with exactly one space and prints other whitespace in a path
+    /// as it is: two spaces, a tab and a trailing space stay part of the path.
+    #[test]
+    fn known_hosts_paths_keep_their_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().display().to_string();
+        for name in ["a  b", "t\tab"] {
+            std::fs::create_dir_all(dir.path().join(name)).unwrap();
+            std::fs::write(dir.path().join(name).join("kh"), "").unwrap();
+        }
+        std::fs::write(dir.path().join("kh"), "").unwrap();
+        std::fs::write(dir.path().join("end "), "").unwrap();
+        let files = |line: &str| SshTarget::parse(line).known_hosts_files(Path::new("/home/me")).unwrap();
+        assert_eq!(
+            files(&format!("userknownhostsfile {root}/a  b/kh {root}/kh\nglobalknownhostsfile none\n")),
+            [dir.path().join("a  b/kh"), dir.path().join("kh")]
+        );
+        assert_eq!(files(&format!("userknownhostsfile {root}/t\tab/kh\n")), [dir.path().join("t\tab/kh")]);
+        assert_eq!(
+            files(&format!("userknownhostsfile {root}/kh {root}/end \n")),
+            [dir.path().join("kh"), dir.path().join("end ")]
+        );
+        // Without a file of that name the trailing space is kept as well.
+        assert_eq!(files("globalknownhostsfile /nonexistent/x \n"), [PathBuf::from("/nonexistent/x ")]);
+    }
+
+    #[test]
+    fn known_hosts_files_default_to_openssh() {
+        let target = SshTarget::parse("hostname h\nport 22\n");
+        assert_eq!(
+            target.known_hosts_files(Path::new("/home/me")).unwrap(),
+            credential_bridge_config::known_hosts::default_files(Path::new("/home/me"))
+        );
+        // OpenSSH 10 prints them expanded.
+        let target = SshTarget::parse(
+            "userknownhostsfile /home/me/.ssh/known_hosts\nglobalknownhostsfile /etc/ssh/ssh_known_hosts\n",
+        );
+        assert_eq!(
+            target.known_hosts_files(Path::new("/home/me")).unwrap(),
+            [PathBuf::from("/home/me/.ssh/known_hosts"), PathBuf::from("/etc/ssh/ssh_known_hosts")]
+        );
+    }
+
+    #[test]
+    fn reads_the_used_host_key_from_the_debug_log() {
+        let log = "debug1: kex: host key algorithm: ssh-ed25519\n\
+                   debug1: Server host key: ssh-ed25519 SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU\n\
+                   Warning: Permanently added 'github.com' (ED25519) to the list of known hosts.\n";
+        assert_eq!(
+            used_host_key(log),
+            Some(UsedHostKey {
+                algorithm: "ssh-ed25519".into(),
+                fingerprint: "SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU".into(),
+                certificate: false,
+                verified: None,
+            })
+        );
+        let cert = "debug1: Server host certificate: ssh-ed25519-cert-v01@openssh.com SHA256:abc, serial 0 \
+                    ID \"box\" CA ssh-ed25519 SHA256:ca valid forever\n";
+        let used = used_host_key(cert).unwrap();
+        assert_eq!((used.describe().as_str(), used.certificate), ("ssh-ed25519 SHA256:abc", true));
+        assert_eq!(used_host_key("debug1: Server host key: ssh-rsa MD5:aa:bb\n"), None);
+        assert_eq!(used_host_key("debug1: Connecting to h\n"), None);
+    }
+
+    /// ssh's own `Found … in <file>:<line>` lines (as `ssh -v -E` writes them, with CR LF)
+    /// count; the same words in text a server controls do not.
+    #[test]
+    fn reads_where_ssh_found_the_key() {
+        let found = |log: &str| known_hosts_match(log);
+        let plain = "debug1: Server host key: ssh-ed25519 SHA256:abc\r\n\
+                     debug1: load_hostkeys: fopen /home/me/.ssh/known_hosts2: No such file or directory\r\n\
+                     debug1: Host 'box' is known and matches the ED25519 host key.\r\n\
+                     debug1: Found key in /home/me/my hosts/kh:12\r\n";
+        assert_eq!(
+            found(plain),
+            Some(KnownHostsMatch { authority: false, file: PathBuf::from("/home/me/my hosts/kh") })
+        );
+        assert_eq!(used_host_key(plain).unwrap().verified, found(plain));
+        let ca = "debug1: Server host certificate: ssh-ed25519-cert-v01@openssh.com SHA256:abc, serial 0\n\
+                  debug1: Host 'box' is known and matches the ED25519-CERT host certificate.\n\
+                  debug1: Found CA key in /etc/ssh/ssh_known_hosts:3\n";
+        assert_eq!(
+            found(ca),
+            Some(KnownHostsMatch { authority: true, file: PathBuf::from("/etc/ssh/ssh_known_hosts") })
+        );
+        // An unknown CA: ssh retries with the plain key, which may be listed.
+        let retry = "debug1: No matching CA found. Retry with plain key\n";
+        assert_eq!(found(retry), None);
+        assert_eq!(
+            found(&format!("{retry}debug1: Found key in /k:1\n")),
+            Some(KnownHostsMatch { authority: false, file: PathBuf::from("/k") })
+        );
+        // Accepted without known_hosts vouching for it.
+        assert_eq!(found("Warning: Permanently added 'box' (ED25519) to the list of known hosts.\n"), None);
+        // Spoof attempts: server messages, versions, banners, disconnect reasons.
+        for spoof in [
+            "debug1: Remote: Found key in /home/me/.ssh/known_hosts:1\n",
+            "debug1: Remote protocol version 2.0, remote software version Found key in /k:1\n",
+            "debug1: kex_exchange_identification: banner line 0: Found key in /k:1\n",
+            "Received disconnect from 10.0.0.1 port 22:2: Found CA key in /k:1\n",
+            "Found key in /k:1\n",
+            "debug1: Found key in /k\n",
+            "debug1: Found key in /k:x\n",
+        ] {
+            assert_eq!(found(spoof), None, "{spoof}");
         }
     }
 
     #[test]
-    fn renders_the_chain() {
-        let ok = [Station::Ok, Station::Ok, Station::Ok, Station::Ok, Station::Ok];
-        assert_eq!(render_chain(&ok), "daemon ━ ssh config ━ ssh ━ helper ━ git    ready");
-        let broken = Station::Broken { problem: "x".into(), fix: "y".into() };
-        let chain = [Station::Ok, broken, Station::Unchecked, Station::Unchecked, Station::Unchecked];
-        assert_eq!(render_chain(&chain), "daemon ━ ssh config ┄ ssh ┄ helper ┄ git    broken");
+    fn ssh_messages_from_the_log_keep_failure_reasons() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(255 << 8),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        let output = output_with_log(
+            output,
+            "debug1: Reading configuration data\nme@h: Permission denied (publickey).\n",
+        );
+        assert_eq!(output.status, Some(255));
+        assert_eq!(output.failure_reason(), "me@h: Permission denied (publickey).");
     }
 
     #[test]
-    fn check_forwards_only_when_that_can_help() {
-        let installed = CheckReport { helper: true, git_entries: 1, ping: String::new() };
-        assert_eq!(after_first_run(true, &installed), NextStep::Reached);
-        assert_eq!(after_first_run(false, &installed), NextStep::Forward);
-        let no_helper = CheckReport { helper: false, git_entries: 0, ping: String::new() };
-        assert_eq!(
-            after_first_run(false, &no_helper),
-            NextStep::Report,
-            "must not take an open session's socket"
-        );
-        let no_git = CheckReport { helper: true, git_entries: 0, ping: String::new() };
-        assert_eq!(after_first_run(false, &no_git), NextStep::Report);
+    fn forward_agent_options() {
+        assert_eq!(forward_agent_option(Path::new("/run/a.sock")), "ForwardAgent=/run/a.sock");
+        assert_eq!(forward_agent_option(Path::new("/my dir/50%.sock")), "ForwardAgent=\"/my dir/50%%.sock\"");
     }
 
     #[test]
-    fn parses_check_output() {
-        let report = CheckReport::parse("helper=yes\ngit-entries=2\nok: reachable\n");
-        assert_eq!(report, CheckReport { helper: true, git_entries: 2, ping: "ok: reachable\n".into() });
-        assert!(!CheckReport::parse("helper=no\n").helper);
+    fn maps_architectures() {
+        assert_eq!(remote_target("x86_64\n"), Some("x86_64-unknown-linux-musl"));
+        assert_eq!(remote_target("arm64"), Some("aarch64-unknown-linux-musl"));
+        assert_eq!(remote_target("s390x"), Some("s390x-unknown-linux-gnu"));
+        assert_eq!(remote_target("riscv64"), None);
     }
 
     #[test]
-    fn matches_forwards() {
-        let forwards = [
-            "/home/r/b.sock /home/l/s/x.sock".to_owned(),
-            "/home/eve space/b.sock /home/l/s/y.sock".to_owned(),
-        ];
+    fn finds_bundled_binaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let helpers = dir.path().join("share/credential-bridge/helpers");
+        std::fs::create_dir_all(&helpers).unwrap();
+        std::fs::write(helpers.join("credential-bridge-remote-x86_64-unknown-linux-musl"), b"bin").unwrap();
+        let exe = dir.path().join("bin/credential-bridge-ctl");
+        let dirs = helper_dirs(Some(Path::new("/nonexistent")), Some(&exe));
+        assert_eq!(dirs.len(), 2);
         assert_eq!(
-            match_forward(&forwards, "/home/l/s/x.sock", Some("/home/r/b.sock")),
-            ForwardStatus::Configured
+            find_bundled_binary(&dirs, "x86_64-unknown-linux-musl"),
+            Some(helpers.join("credential-bridge-remote-x86_64-unknown-linux-musl"))
         );
-        assert_eq!(match_forward(&forwards, "/home/l/s/x.sock", None), ForwardStatus::Configured);
-        assert_eq!(
-            match_forward(&forwards, "/home/l/s/x.sock", Some("/other.sock")),
-            ForwardStatus::WrongRemotePath("/home/r/b.sock".into())
-        );
-        assert_eq!(match_forward(&forwards, "/home/l/s/z.sock", None), ForwardStatus::Missing);
-        assert_eq!(
-            match_forward(&forwards, "/home/l/s/y.sock", Some("/home/eve space/b.sock")),
-            ForwardStatus::Configured,
-            "a remote home with a space"
-        );
-        assert_eq!(
-            match_forward(&["/a/b.sock /x/s/x.sock".to_owned()], "s/x.sock", None),
-            ForwardStatus::Missing
-        );
+        assert_eq!(find_bundled_binary(&dirs, "s390x-unknown-linux-gnu"), None);
+        assert_eq!(helper_dirs(Some(Path::new("")), None), Vec::<PathBuf>::new());
     }
 
     #[test]
-    fn origins_merge_patterns() {
-        let o =
-            origins(&remote(&["https://github.com", "https://github.com/org/*", "https://git.example.com"]))
-                .unwrap();
-        assert_eq!(
-            o.into_iter().collect::<Vec<_>>(),
-            [("https://git.example.com".to_owned(), false), ("https://github.com".to_owned(), true)]
-        );
-    }
-
-    #[test]
-    fn install_script_uploads_and_sets_up() {
-        let allow = ["https://github.com/org/*".to_owned(), "https://x.example".to_owned()];
-        let script = install_script("/home/me/.local/bin/h", "/home/me/s/bridge.sock", &allow, true);
-        assert_eq!(
-            script,
-            "set -eu\nmkdir -p /home/me/.local/bin\ncat > /home/me/.local/bin/h.tmp\n\
-             chmod 755 /home/me/.local/bin/h.tmp\nmv -f /home/me/.local/bin/h.tmp /home/me/.local/bin/h\n\
-             /home/me/.local/bin/h setup --socket /home/me/s/bridge.sock 'https://github.com/org/*' https://x.example\n"
-        );
-        let script = install_script("/h", "/s.sock", &allow, false);
-        assert!(script.contains("setup --socket /s.sock --no-git-config "));
-    }
-
-    #[test]
-    fn uninstall_script_lets_the_helper_clean_up() {
-        let script = uninstall_script();
-        assert!(script.contains("h=\"$HOME\"/.local/bin/git-credential-bridge\n"));
-        assert!(script.contains("\"$h\" uninstall --remove-binary"));
+    fn output_failure_reason() {
+        let output = RemoteOutput {
+            status: Some(255),
+            stdout: String::new(),
+            stderr: "a\nPermission denied\n\n".into(),
+        };
+        assert_eq!(output.failure_reason(), "Permission denied");
+        assert!(!output.success());
+        let output = RemoteOutput { status: Some(3), ..RemoteOutput::default() };
+        assert_eq!(output.failure_reason(), "exit status 3");
     }
 }

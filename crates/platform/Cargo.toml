@@ -1,0 +1,38 @@
+[package]
+name = "credential-bridge-platform"
+description = "Platform interfaces for credential-bridge: peer credentials, hardening, sandbox, fd passing, dialogs, services"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+rustix = { workspace = true, features = ["event", "stdio"] }
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock.workspace = true
+libc = "0.2.191"
+
+# seccompiler supports these architectures only; elsewhere the layer is reported missing.
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))'.dependencies]
+seccompiler.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.191"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# The workspace lints, except that `unsafe_code` is `deny` instead of `forbid`: this is
+# the one crate where `#[allow(unsafe_code)]` may appear on single items (macOS FFI for
+# `getpeereid`, `LOCAL_PEERPID`, `proc_pidpath`, `PT_DENY_ATTACH` and `sandbox_init`).
+# Keep the rest in sync with `[workspace.lints]`.
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

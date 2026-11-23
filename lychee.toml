@@ -1,0 +1,40 @@
+# Link check for the Markdown files (`nix run .#links`, `just links`, the links
+# workflow; `checks.links` runs it with `--offline`). The inputs are given by the
+# app, together with a remap that checks links to this repository's main branch
+# against the working tree.
+
+# Fragments: `#anchor` in local files and in fetched pages (lychee 0.24 wants a
+# mode here; "anchor-only" is what `true` meant before).
+include_fragments = "anchor-only"
+# No `.lycheecache`: every run checks everything again.
+cache = false
+no_progress = true
+
+timeout = 20
+max_retries = 3
+retry_wait_time = 2
+max_concurrency = 16
+# 429: rate limited (mostly GitHub); the link existed, it was only not served.
+accept = ["200..=299", "429"]
+
+# Generated or vendored files that are not part of the repository.
+exclude_path = [
+  '(^|/)target/',
+  '(^|/)result(-[^/]*)?/',
+  '(^|/)\.direnv/',
+  '^fuzz/(corpus|artifacts|coverage)/',
+]
+
+exclude_loopback = true
+exclude = [
+  # Placeholder hosts in the configuration examples.
+  '^https?://([^/]+\.)?example\.(com|org|net)([/:]|$)',
+  '^https?://dev\.azure\.com/org/',
+  '^https?://github\.com/my-org/',
+  # Keep a Changelog compare links of this repository. The newest one ends in the
+  # tag of the version being released (or starts from it, `...HEAD`), and the
+  # release workflow creates that tag only after the commit is on main, so the
+  # push of the release commit would always fail. Release tag pages
+  # (`releases/tag/...`) are still checked.
+  '^https://github\.com/XeS0r/ssh-credential-bridge/compare/v[0-9][0-9A-Za-z.+-]*\.\.\.(HEAD|v[0-9][0-9A-Za-z.+-]*)$',
+]

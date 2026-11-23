@@ -1,5 +1,10 @@
 # Everything `just check` runs: build, tests, clippy (Linux + macOS), rustfmt,
-# Markdown, static helpers under qemu, the release package and the VM tests.
+# Markdown, local links, the remote binaries under qemu, the release package, a
+# short fuzz run of every target and the VM test.
+#
+# Two jobs with the same steps, because permissions cannot depend on the event: pull
+# requests only restore the Nix store and run with a read-only token; pushes to main
+# also save it and delete outdated caches, which needs `actions: write`.
 name: CI
 
 on:
@@ -7,19 +12,28 @@ on:
     branches: [main]
   pull_request:
 
-permissions:
-  contents: read
-  # Lets cache-nix-action delete outdated caches (10 GB per repository).
-  actions: write
+permissions: {}
+
+# A new push to a pull request cancels its running check; runs on main always finish.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   check:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
-      # The full check builds the Rust toolchain for four targets, a s390x
-      # cross compiler and five VM images; the runner's 14 GB are not enough.
+      # The full check builds the Rust toolchain for four targets, musl and s390x
+      # cross compilers, a nightly toolchain for fuzzing and four VM images; the
+      # runner's 14 GB are not enough.
       - name: Free disk space
         run: |
           df -h /
@@ -35,6 +49,42 @@ jobs:
           extra_nix_config: |
             system-features = nixos-test benchmark big-parallel kvm
 
+      # Restores what main has built; saves nothing.
+      - name: Restore the Nix store
+        uses: nix-community/cache-nix-action/restore@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', 'flake.lock', 'Cargo.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+
+      - run: nix flake check -L
+
+  check-main:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      # Lets cache-nix-action delete outdated caches (10 GB per repository).
+      actions: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # As in `check`.
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force > /dev/null
+          df -h /
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            system-features = nixos-test benchmark big-parallel kvm
+
       # Keeps the Nix store between runs, so later runs only rebuild what
       # changed. Keyed on everything that decides what gets built.
       - name: Restore and save the Nix store
@@ -43,9 +93,7 @@ jobs:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', 'flake.lock', 'Cargo.lock') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
           gc-max-store-size-linux: 6G
-          # Pull requests from forks get a read-only token and cannot delete
-          # caches; only pushes clean up.
-          purge: ${{ github.event_name == 'push' }}
+          purge: true
           purge-prefixes: nix-${{ runner.os }}-
           purge-created: 0
           purge-last-accessed: P7D

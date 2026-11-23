@@ -1,0 +1,62 @@
+[package]
+name = "credential-bridge-fuzz"
+description = "cargo-fuzz targets for the credential-bridge wire formats"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# A workspace of its own: the fuzz targets need nightly and libFuzzer, so they stay out
+# of the main workspace and its stable builds.
+[workspace]
+members = ["."]
+
+[dependencies]
+credential-bridge-gpg = { path = "../crates/gpg" }
+credential-bridge-proto = { path = "../crates/proto", features = ["bind"] }
+libfuzzer-sys = "0.4.10"
+
+[[bin]]
+name = "agent_frame"
+path = "fuzz_targets/agent_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_bind"
+path = "fuzz_targets/session_bind.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extension_payload"
+path = "fuzz_targets/extension_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "git_credential"
+path = "fuzz_targets/git_credential.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipc_frame"
+path = "fuzz_targets/ipc_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "assuan_filter"
+path = "fuzz_targets/assuan_filter.rs"
+test = false
+doc = false
+bench = false

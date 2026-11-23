@@ -1,0 +1,20 @@
+[package]
+name = "credential-bridge-integration"
+description = "Cross-crate tests: the real credential-bridged and credential-bridge-remote binaries together"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# The tests run the daemon binary as a process and the remote git helper in-process
+# (see tests/common/mod.rs). Only this crate may depend on binary crates.
+[dev-dependencies]
+credential-bridge-proto.workspace = true
+credential-bridge-remote.workspace = true
+credential-bridge-testutil.workspace = true
+credential-bridged.workspace = true
+
+[lints]
+workspace = true

@@ -3,30 +3,66 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/XeS0r/ssh-credential-bridge"
-homepage = "https://github.com/XeS0r/ssh-credential-bridge"
 
 [workspace.dependencies]
+# Internal crates. See docs/architecture.md for the allowed dependency edges.
+credential-bridge-config = { path = "crates/config" }
+credential-bridge-forge = { path = "crates/forge" }
+credential-bridge-gpg = { path = "crates/gpg" }
+credential-bridge-platform = { path = "crates/platform" }
 credential-bridge-proto = { path = "crates/proto" }
-credential-bridge-core = { path = "crates/core" }
+credential-bridge-remote = { path = "crates/remote" }
+credential-bridge-testutil = { path = "crates/testutil" }
+credential-bridge-vault = { path = "crates/vault" }
+credential-bridged = { path = "crates/daemon" }
 
-anyhow = "1"
-clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
-clap_complete = "4.5"
-clap_mangen = "0.2"
-rustix = { version = "1", features = ["process"] }
-serde = { version = "1", features = ["derive"] }
-tempfile = "3"
-thiserror = "2"
-tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "process", "signal", "sync", "time"] }
-toml = "0.8"
-toml_edit = "0.22"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0.104"
+base64ct = { version = "1.8", features = ["alloc"] }
+clap = { version = "4.6", features = ["derive", "env", "wrap_help"] }
+jsonwebtoken = { version = "12.0", default-features = false, features = ["use_pem", "rust_crypto"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "http2"] }
+hmac = "0.12"
+rustix = { version = "1.1.6", features = ["fs", "net", "process", "thread"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha1 = { version = "0.10", default-features = false }
+ssh-key = { version = "0.6.7", default-features = false, features = [
+  "std",
+  "ed25519",
+  "p256",
+  "p384",
+  "p521",
+  "rsa",
+] }
+tempfile = "3.27"
+thiserror = "2.0"
+tokio = { version = "1.54", features = [
+  "rt",
+  "macros",
+  "net",
+  "io-util",
+  "process",
+  "signal",
+  "sync",
+  "time",
+] }
+toml = "1.2"
+toml_edit = "0.25"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+url = "2.5.8"
+zeroize = { version = "1.9", features = ["derive"] }
+
+# Platform-specific.
+landlock = "0.4.8"
+seccompiler = "0.5"
+security-framework = "3.7"
+zbus = { version = "6.4", default-features = false, features = ["tokio", "proxy"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

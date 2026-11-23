@@ -1,28 +1,46 @@
 [package]
 name = "credential-bridged"
-description = "Serves local git credentials to SSH remotes over per-remote unix sockets"
+description = "credential-bridge daemon: ssh-agent proxy with key mux, server recognition, policy and workers"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 publish = false
+
+[lib]
+name = "credential_bridged"
+path = "src/lib.rs"
+
+[[bin]]
+name = "credential-bridged"
+path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-clap_mangen.workspace = true
-credential-bridge-core.workspace = true
-credential-bridge-proto.workspace = true
-rustix.workspace = true
+clap_mangen = "0.2"
+credential-bridge-config.workspace = true
+credential-bridge-forge.workspace = true
+credential-bridge-gpg.workspace = true
+credential-bridge-platform.workspace = true
+credential-bridge-proto = { workspace = true, features = ["bind"] }
+credential-bridge-vault.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ssh-key.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
+credential-bridge-testutil.workspace = true
+rustix = { workspace = true, features = ["process"] }
+signature = "2.2"
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

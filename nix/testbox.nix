@@ -1,8 +1,11 @@
 # Throwaway NixOS guest for trying credential-bridge by hand: `just vm` / `nix run .#vm`.
 #
 # sshd on 127.0.0.1:2222, user `test` with password `test`. The root file system is a
-# tmpfs, so every start begins from scratch (new host key, no helper, no git config).
-# The console runs in the terminal; quit with Ctrl-A X or `sudo poweroff`.
+# tmpfs, so every start begins from scratch (new host key, no remote binary, no git
+# config): `credential-bridge-ctl server add` follows its known_hosts entry, so a new
+# host key on each boot only needs accepting in known_hosts (`ssh-keygen -R`, then ssh
+# again), and `server add` again installs the remote binary. The console runs in the
+# terminal; quit with Ctrl-A X or `sudo poweroff`.
 {
   lib,
   pkgs,
@@ -31,11 +34,7 @@
 
   services.openssh = {
     enable = true;
-    settings = {
-      PasswordAuthentication = true;
-      # Replaces a stale forwarded socket left by an earlier connection.
-      StreamLocalBindUnlink = "yes";
-    };
+    settings.PasswordAuthentication = true;
   };
 
   users.users.test = {
@@ -46,5 +45,8 @@
   security.sudo.wheelNeedsPassword = false;
   services.getty.autologinUser = "test";
 
-  environment.systemPackages = [ pkgs.git ];
+  environment.systemPackages = [
+    pkgs.git
+    pkgs.gnupg
+  ];
 }

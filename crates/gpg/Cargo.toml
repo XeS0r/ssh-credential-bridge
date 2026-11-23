@@ -1,0 +1,17 @@
+[package]
+name = "credential-bridge-gpg"
+description = "Assuan parsing, command filter and extension framing for the credential-bridge gpg bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+credential-bridge-proto.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true
