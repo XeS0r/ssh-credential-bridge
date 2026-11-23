@@ -1,16 +1,34 @@
 [package]
 name = "credential-bridge-proto"
-description = "Wire formats shared by the credential-bridge tools"
+description = "Wire formats shared by the credential-bridge programs: ssh-agent protocol, extensions, worker IPC"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 publish = false
 
+[features]
+default = []
+# session-bind@openssh.com parsing and signature verification (pulls in ssh-key).
+bind = ["dep:ssh-key", "dep:signature"]
+# The GitHub API URL check shared by config validation and the forge client.
+api-url = ["dep:url"]
+
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
+# The `Verifier` trait ssh-key implements; same major version as ssh-key 0.6 uses.
+signature = { version = "2.2", optional = true }
+ssh-key = { workspace = true, optional = true }
 thiserror.workspace = true
+url = { workspace = true, optional = true }
+zeroize.workspace = true
+
+[dev-dependencies]
+proptest = { version = "1.9", default-features = false, features = ["std"] }
+rsa = "0.9.10"
+ssh-key = { workspace = true, features = ["getrandom"] }
 
 [lints]
 workspace = true

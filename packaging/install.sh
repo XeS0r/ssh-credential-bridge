@@ -29,13 +29,58 @@ done
 
 manifest=$prefix/share/credential-bridge/installed-files
 ctl=$prefix/bin/credential-bridge-ctl
+case "$(uname -s)" in
+  Darwin) service_definition=$HOME/Library/LaunchAgents/io.github.xes0r.credential-bridge.plist ;;
+  *) service_definition=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/credential-bridge.service ;;
+esac
+
+# credential-bridge 0.1 must be removed with its own programs before 0.2 is installed
+# over it (CHANGELOG.md, 0.2.0). Found by its service, its manifest or a
+# credential-bridge-ctl of version 0.1. $1: the bin directory, $2: the
+# manifest of a release package installation.
+refuse_v01() {
+  found=
+  for unit in "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/credential-bridged.service" \
+    "$HOME/.config/systemd/user/credential-bridged.service" \
+    "$HOME/Library/LaunchAgents/local.credential-bridge.daemon.plist"; do
+    if [ -e "$unit" ]; then
+      found="its service $unit"
+      break
+    fi
+  done
+  if [ -z "$found" ] && [ -f "$2" ] && grep -qx 'bin/git-credential-bridge' "$2"; then
+    found="its files, listed in $2"
+  fi
+  if [ -z "$found" ] && [ -x "$1/credential-bridge-ctl" ]; then
+    # 0.1 prints "credential-bridge-ctl 0.1.x" and has a remote command; a ctl that
+    # does not run at all is not taken for 0.1.
+    case "$("$1/credential-bridge-ctl" --version 2>/dev/null)" in
+      "credential-bridge-ctl 0.1."*) found="its $1/credential-bridge-ctl" ;;
+    esac
+    if [ -z "$found" ] && "$1/credential-bridge-ctl" remote --help >/dev/null 2>&1; then
+      found="its $1/credential-bridge-ctl"
+    fi
+  fi
+  [ -z "$found" ] && return 0
+  cat >&2 <<EOF
+credential-bridge 0.1 is installed ($found); nothing was installed.
+Remove it first, with its programs still installed (CHANGELOG.md, 0.2.0):
+  credential-bridge-ctl remote uninstall NAME   # for every remote
+  credential-bridge-ctl service uninstall
+then remove the RemoteForward lines from ~/.ssh/config and run this again.
+Without the 0.1 programs, stop its service by hand and delete its unit file or plist:
+  systemctl --user disable --now credential-bridged.service        # Linux
+  launchctl bootout gui/\$(id -u)/local.credential-bridge.daemon    # macOS
+EOF
+  exit 1
+}
 
 if [ "$action" = uninstall ]; then
   if [ ! -f "$manifest" ]; then
     echo "credential-bridge is not installed in $prefix" >&2
     exit 1
   fi
-  "$ctl" service uninstall >/dev/null 2>&1 && echo "✓ service removed" || true
+  "$ctl" daemon uninstall >/dev/null 2>&1 && echo "✓ service removed" || true
   while IFS= read -r file; do
     rm -f "$prefix/$file"
   done < "$manifest"
@@ -49,6 +94,7 @@ fi
   echo "install.sh: run me from the unpacked release directory" >&2
   exit 1
 }
+refuse_v01 "$prefix/bin" "$manifest"
 
 updating=false
 [ -f "$manifest" ] && updating=true
@@ -76,7 +122,8 @@ chmod 644 "$manifest"
 version=$("$ctl" --version 2>/dev/null | cut -d' ' -f2)
 if $updating; then
   echo "✓ updated credential-bridge $version in $prefix"
-  if "$ctl" service restart >/dev/null 2>&1; then
+  # A service that is set up gets reinstalled, which restarts the daemon.
+  if [ -e "$service_definition" ] && "$ctl" daemon install >/dev/null 2>&1; then
     echo "✓ service restarted"
   fi
 else
@@ -92,11 +139,12 @@ esac
 if ! $updating; then
   cat <<EOF
 
-Next:
-  credential-bridge-ctl service install
-  credential-bridge-ctl remote add NAME --allow 'https://github.com/ORG/*'
-  credential-bridge-ctl remote install NAME
-  credential-bridge-ctl remote ssh-config NAME >> ~/.ssh/config
-  credential-bridge-ctl remote check NAME
+Next (see README.md):
+  credential-bridge-ctl init                    # finds your agents, writes the configuration
+  credential-bridge-ctl profile add dev ssh.keys=all
+  credential-bridge-ctl daemon install
+  credential-bridge-ctl server add NAME --profile dev
+  credential-bridge-ctl server ssh-config NAME  # add what it prints to ~/.ssh/config
+  credential-bridge-ctl check
 EOF
 fi

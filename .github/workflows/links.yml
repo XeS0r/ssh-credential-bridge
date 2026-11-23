@@ -1,0 +1,43 @@
+# Link check of every Markdown file with lychee (lychee.toml), including external
+# links and their anchors: `nix run .#links`, as locally. `nix flake check`
+# (checks.links) covers only the local links and anchors, offline; this catches
+# external links that broke, on pushes, on pull requests that touch the docs and
+# weekly.
+name: Links
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "**.md"
+      - lychee.toml
+      - flake.nix
+      - flake.lock
+      - .github/workflows/links.yml
+  schedule:
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# As in ci.yml: a new push to a pull request cancels its running check.
+concurrency:
+  group: links-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  links:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # lychee comes from cache.nixos.org; restoring CI's Nix store cache (several
+      # GB) would take longer than that.
+      - uses: cachix/install-nix-action@v31
+
+      - run: nix run .#links

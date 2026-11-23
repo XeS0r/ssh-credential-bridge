@@ -1,0 +1,36 @@
+[package]
+name = "credential-bridge-vault"
+description = "Vault worker of credential-bridge: resolves secret references, unlock sessions, gh and git helper sources"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+default = ["secret-service"]
+# Secret Service over D-Bus (Linux: GNOME Keyring, KWallet, KeePassXC).
+secret-service = ["dep:zbus"]
+
+[dependencies]
+credential-bridge-config.workspace = true
+credential-bridge-proto.workspace = true
+rustix.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,27 @@
+[package]
+name = "credential-bridge-config"
+description = "Configuration schema, validation and paths for credential-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+base64ct.workspace = true
+credential-bridge-proto = { workspace = true, features = ["api-url"] }
+hmac.workspace = true
+rustix.workspace = true
+serde.workspace = true
+sha1.workspace = true
+ssh-key.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+toml_edit.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

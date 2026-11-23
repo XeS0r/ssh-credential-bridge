@@ -1,19 +1,39 @@
-# Push a tag like v0.2.0 to publish the release packages
-# (credential-bridge-<version>-<platform>.tar.gz and SHA256SUMS).
+# Push a tag like v0.2.0 on a commit of main to publish the release packages
+# (credential-bridge-<version>-<platform>.tar.gz and SHA256SUMS) with a build
+# provenance attestation. The tagged commit must be on main and pass the checks first.
 name: Release
 
 on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
+permissions: {}
+
+# One release per tag at a time; a running release is never cancelled halfway.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   release:
+    # Releases come only from the public repository; a tag pushed to a fork or a
+    # private mirror publishes nothing.
+    if: github.repository == 'XeS0r/ssh-credential-bridge'
     runs-on: ubuntu-latest
+    timeout-minutes: 240
+    permissions:
+      # gh release create.
+      contents: write
+      # Sign the build provenance (Sigstore) and store it as an attestation.
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
+      # The full history, so that main is there to compare with; the token is not
+      # kept in the git config.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Check that the tag matches the version in Cargo.toml
         run: |
@@ -23,15 +43,32 @@ jobs:
             exit 1
           }
 
-      # Static builds for two platforms plus every server helper.
+      - name: Check that the tagged commit is on main
+        run: |
+          git rev-parse --verify --quiet refs/remotes/origin/main > /dev/null || {
+            echo "origin/main was not fetched" >&2
+            exit 1
+          }
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main || {
+            echo "tag $GITHUB_REF_NAME ($GITHUB_SHA) is not a commit on main" >&2
+            exit 1
+          }
+
+      # Static builds of the local programs for two platforms, every remote binary and
+      # the VM test.
       - name: Free disk space
         run: |
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
             /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force > /dev/null
           df -h /
 
+      # Also gives the runner user access to /dev/kvm for the VM test.
       - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            system-features = nixos-test benchmark big-parallel kvm
 
       # Reuses what CI has built for main; saves nothing of its own.
       - name: Restore the Nix store
@@ -43,11 +80,32 @@ jobs:
       - name: Release notes from CHANGELOG.md
         run: sh packaging/release-notes.sh "${GITHUB_REF_NAME#v}" > "$RUNNER_TEMP/notes.md"
 
+      # Everything `nix flake check` runs except the fuzz smoke run (random inputs, run
+      # weekly for longer) and the macOS type check (no macOS packages are released).
+      - name: Checks of the tagged commit
+        run: |
+          nix build -L --no-link \
+            .#checks.x86_64-linux.tests \
+            .#checks.x86_64-linux.clippy \
+            .#checks.x86_64-linux.fmt \
+            .#checks.x86_64-linux.markdown \
+            .#checks.x86_64-linux.changelog \
+            .#checks.x86_64-linux.release \
+            .#checks.x86_64-linux.remotes \
+            .#checks.x86_64-linux.e2e
+
       - run: nix build -L .#release
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            result/*.tar.gz
+            result/SHA256SUMS
 
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" result/* --title "$GITHUB_REF_NAME" \
-            --notes-file "$RUNNER_TEMP/notes.md"
+            --notes-file "$RUNNER_TEMP/notes.md" --repo "$GITHUB_REPOSITORY"

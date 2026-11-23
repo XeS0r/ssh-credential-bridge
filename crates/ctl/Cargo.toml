@@ -1,22 +1,37 @@
 [package]
 name = "credential-bridge-ctl"
-description = "Manage credential-bridge: the local daemon service and the SSH remotes it serves"
+description = "Manage credential-bridge: configuration, servers, checks, unlocking, GitHub Apps and the service"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 publish = false
+
+[lib]
+name = "credential_bridge_ctl"
+path = "src/lib.rs"
+
+[[bin]]
+name = "credential-bridge-ctl"
+path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-clap_complete.workspace = true
-clap_mangen.workspace = true
-credential-bridge-core.workspace = true
+clap_complete = "4.6"
+clap_mangen = "0.2"
+credential-bridge-config.workspace = true
+credential-bridge-forge.workspace = true
+credential-bridge-platform.workspace = true
 credential-bridge-proto.workspace = true
-rustix.workspace = true
+rustix = { workspace = true, features = ["termios"] }
+serde_json.workspace = true
+ssh-key.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true
